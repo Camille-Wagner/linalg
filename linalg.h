@@ -4,7 +4,7 @@
 #define LINALG_NO_SIMD
 
 #define EPSILON 0.000000000000001
-#define STRASSEN_THRESHHOLD 128
+#define STRASSEN_THRESHHOLD 16
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -886,6 +886,7 @@ mat *mat_mult(const mat *left, const mat *right, err *error) {
     #endif
 }
 
+/*
 void _strassen_arena(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, arena_t *arena, size_t n) {
     if (n <= STRASSEN_THRESHHOLD) {
         for (size_t i = 0; i < n; ++i) {
@@ -992,7 +993,7 @@ size_t _strassen_arena_size(size_t n) {
     return total;
 }
 
-mat *mat_mult_strassen_arena(const mat *left, const mat *right, err *error){
+mat *mat_mult_strassen_arena(const mat *left, const mat *right, err *error) {
     if (left == NULL || right == NULL) {
         if (error != NULL) {
             *error = NULL_ARGUMENT;
@@ -1030,95 +1031,206 @@ mat *mat_mult_strassen_arena(const mat *left, const mat *right, err *error){
     return C;
 }
 
-void _strassen(const float *restrict A, const float *restrict B, float *restrict C, size_t n) {
-    // Base case
-    if (n <= STRASSEN_THRESHHOLD) {
-        for (size_t i = 0; i < n; ++i) {
-            for (size_t k = 0; k < n; ++ k) {
-                float a = A[i * n + k];
-                for (size_t j = 0; j < n; ++j) {
-                    C[i * n + j] += a * B[k * n + j];
+*/
+
+
+void _strassen(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, size_t n, size_t i, size_t m) {
+    /*
+    A represents an n by i matrix
+    A may be a view into a larger row-major matrix with leading dimension lda
+    
+    B represents an i by m matrix
+    B may be a view into a larger row-major matrix with leading dimension ldb
+    
+    C represenets an n by m matrix
+    C may be a view into a larger row-major matrix with leading dimension ldc
+    */
+
+    if (n <= STRASSEN_THRESHHOLD || i <= STRASSEN_THRESHHOLD || m <= STRASSEN_THRESHHOLD) {
+        for (size_t r = 0; r < n; ++r) {
+            for (size_t c = 0; c < m; ++c) {
+                float sum = 0;
+                for (size_t k = 0; k < i; ++k) {
+                    sum += A[r * lda + k] * B[k * ldb + c];
                 }
+                C[r * ldc + c] = sum;
             }
         }
     }
 
-    // Recursion step
     else {
-        size_t k = n/2;
+        size_t n2 = n/2;
+        size_t n1 = n - n2;
+        size_t i2 = i/2;
+        size_t i1 = i - i2;
+        size_t m2 = m/2;
+        size_t m1 = m - m2;
 
-        float *P1 = malloc(k * k * sizeof(float));
-        float *P2 = malloc(k * k * sizeof(float));
-        float *P3 = malloc(k * k * sizeof(float));
-        float *P4 = malloc(k * k * sizeof(float));
-        float *P5 = malloc(k * k * sizeof(float));
-        float *P6 = malloc(k * k * sizeof(float));
-        float *P7 = malloc(k * k * sizeof(float));
+        // A-side sums
+        float *S1 = malloc(n1 * i1 * sizeof(float));
+        float *S3 = malloc(n1 * i2 * sizeof(float));
+        float *S5 = malloc(n1 * i1 * sizeof(float));
+        float *S8 = malloc(n2 * i1 * sizeof(float));
+        float *S9 = malloc(n1 * i1 * sizeof(float));
 
-        float *S1 = malloc(k * k * sizeof(float));
-        float *S2 = malloc(k * k * sizeof(float));
-        float *S3 = malloc(k * k * sizeof(float));
-        float *S4 = malloc(k * k * sizeof(float));
-        float *S5 = malloc(k * k * sizeof(float));
-        float *S6 = malloc(k * k * sizeof(float));
-        float *S7 = malloc(k * k * sizeof(float));
-        float *S8 = malloc(k * k * sizeof(float));
-        float *S9 = malloc(k * k * sizeof(float));
-        float *S10 = malloc(k * k * sizeof(float));
+        // B-side sums
+        float *S2 = malloc(i1 * m1 * sizeof(float));
+        float *S4 = malloc(i2 * m1 * sizeof(float));
+        float *S6 = malloc(i1 * m1 * sizeof(float));
+        float *S7 = malloc(i1 * m2 * sizeof(float));
+        float *S10 = malloc(i1 * m1 * sizeof(float));
 
-        float *A11 = malloc(k * k * sizeof(float));
-        float *A22 = malloc(k * k * sizeof(float));
-        float *B11 = malloc(k * k * sizeof(float));
-        float *B22 = malloc(k * k * sizeof(float));
+        // Partitions
+        float *P1 = malloc(n1 * m1 * sizeof(float));
+        float *P2 = malloc(n1 * m1 * sizeof(float));
+        float *P3 = malloc(n1 * m1 * sizeof(float));
+        float *P4 = malloc(n1 * m2 * sizeof(float));
+        float *P5 = malloc(n2 * m1 * sizeof(float));
+        float *P6 = malloc(n1 * m2 * sizeof(float));
+        float *P7 = malloc(n2 * m1 * sizeof(float));
 
-        for (size_t i = 0; i < k; ++i) {
-            for (size_t j = 0; j < k; ++j) {
-                S1[i * k + j]  = A[i * n + j] + A[(i + k) * n + j];             // A11 + A21
-                S3[i * k + j]  = A[i * n + (j + k)] + A[(i + k) * n + (j + k)]; // A12 + A22
-                S5[i * k + j]  = A[i * n + j] - A[(i + k) * n + (j + k)];       // A11 - A22
-                S8[i * k + j]  = A[(i + k) * n + j] + A[(i + k) * n + (j + k)]; // A21 + A22
-                S9[i * k + j]  = A[i * n + j] + A[i * n + (j + k)];             // A11 + A12
+        // Padded containers 
+        float *A22_pad = malloc(n2 * i1 * sizeof(float));
+        float *B22_pad = malloc(i1 * m2 * sizeof(float));
 
-                S2[i * k + j]  = B[i * n + j] + B[i * n + (j + k)];             // B11 + B12
-                S4[i * k + j]  = B[(i + k) * n + j] + B[(i + k) * n + (j + k)]; // B21 + B22
-                S6[i * k + j]  = B[i * n + j] + B[(i + k) * n + (j + k)];       // B11 + B22
-                S7[i * k + j]  = B[i * n + (j + k)] - B[(i + k) * n + (j + k)]; // B12 - B22
-                S10[i * k + j] = B[(i + k) * n + j] - B[i * n + j];             // B21 - B11
+        // Filling A-side sum matrices
+        size_t r = 0;
+        for (; r < n2; ++r) {
+            size_t c = 0;
+            for (; c < i2; ++c) {
+                // All matrices can be accessed here
+                S1[r * i1 + c] = A[r * lda + c] + A[(r + n1) * lda + c];             // S1 = A11 + A21
+                S3[r * i2 + c] = A[r * lda + c + i1] + A[(r + n1) * lda + c + i1];   // S3 = A12 + A22
+                S5[r * i1 + c] = A[r * lda + c] - A[(r + n1) * lda + c + i1];        // S5 = A11 - A22
+                S8[r * i1 + c] = A[(r + n1) * lda + c] + A[(r + n1) * lda + c + i1]; // S8 = A21 + A22
+                S9[r * i1 + c] = A[r * lda + c] + A[r * lda + c + i1];               // S9 = A11 + A12
 
-                A11[i * k + j] = A[i * n + j];
-                A22[i * k + j] = A[(i + k) * n + (j + k)];
+                A22_pad[r * i1 + c] = A[(r + n1) * lda + c + i1];
+            }
 
+            for (; c < i1; ++c) {
+                // Only matrices with i1 columns can be accesed here (A11, A21)
+                S1[r * i1 + c] = A[r * lda + c] + A[(r + n1) * lda + c]; // S1 = A11 + A21
+                                                                         // S3 has i2 columns, so is ommited
+                S5[r * i1 + c] = A[r * lda + c]     ;                    // S5 = A11 (- A22)
+                S8[r * i1 + c] = A[(r + n1) * lda + c];                  // S8 = A21 (+ A22)
+                S9[r * i1 + c] = A[r * lda + c] ;                        // S9 = A11 (+ A12)
 
-                B11[i * k + j] = B[i * n + j];
-                B22[i * k + j] = B[(i + k) * n + (j + k)];
+                A22_pad[r * i1 + c] = 0;
+            }
+        }
+        for (; r < n1; ++r) {
+            size_t c = 0;
+            for (; c < i2; ++c) {
+                // Only matrices with n1 rows can be accesed here (A11, A12)
+                S1[r * i1 + c] = A[r * lda + c];                       // S1 = A11 (+ A21)
+                S3[r * i2 + c] = A[r * lda + c + i1];                  // S3 = A12 (+ A22)
+                S5[r * i1 + c] = A[r * lda + c];                       // S5 = A11 (- A22)
+                                                                       // S8 has r2 rows, so is ommited
+                S9[r * i1 + c] = A[r * lda + c] + A[r * lda + c + i1]; // S9 = A11 + A12
+            }
+
+            for (; c < i1; ++c) {
+                // Only matrices with n1 rows and i1 columns can be accesed (A11)
+                S1[r * i1 + c] = A[r * lda + c]; // S1 = A11 (+ A21)
+                                                 // S3 has i2 columns, so is ommited
+                S5[r * i1 + c] = A[r * lda + c]; // S5 = A11 (- A22)
+                                                 // S8 has r2 rows, so is ommited
+                S9[r * i1 + c] = A[r * lda + c]; // S9 = A11 (+ A12)
             }
         }
 
-        _strassen(S1, S2, P1, k);   // (A11 + A21) * (B11 + B12)
-        _strassen(S3, S4, P2, k);   // (A12 + A22) * (B21 + B22)
-        _strassen(S5, S6, P3, k);   // (A11 - A22) * (B11 + B22)
-        _strassen(A11, S7, P4, k);  // A11 * (B12 - B22)
-        _strassen(S8, B11, P5, k);  // (A21 + A22) * B11
-        _strassen(S9, B22, P6, k);  // (A11 + A12) * B22
-        _strassen(A22, S10, P7, k); // A22 * (B21 - B11)
+        // Filling B-side sum matrices
+        r = 0;
+        for (; r < i2; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // All matrices can be accessed here
+                S2[r * m1 + c] = B[r * ldb + c] + B[r * ldb + c + m1];               // S2 = B11 + B12
+                S4[r * m1 + c] = B[(r + i1) * ldb + c] + B[(r + i1) * ldb + c + m1]; // S4 = B21 + B22
+                S6[r * m1 + c] = B[r * ldb + c] + B[(r + i1) * ldb + c + m1];        // S6 = B11 + B22
+                S7[r * m2 + c] = B[r * ldb + c + m1] - B[(r + i1) * ldb + c + m1];   // S7 = B12 - B22
+                S10[r * m1 + c] = B[(r + i1) * ldb + c] - B[r * ldb + c];            // S10 = B21 - B11
 
-        for (size_t i = 0; i < k; ++i) {
-            for (size_t j = 0; j < k; ++j) {
-                C[i * n + j] = P2[i * k + j] + P3[i * k + j] - P6[i * k + j] - P7[i * k + j];             // C11 = P2 + P3 - P6 - P7
-                C[i * n + (j + k)] = P4[i * k + j] + P6[i * k + j];                                       // C12 = P4 + P6
-                C[(i + k) * n + j] = P5[i * k + j] + P7[i * k + j];                                       // C21 = P5 + P7
-                C[(i + k) * n + (j + k)] = P1[i * k + j] - P3[i * k + j] - P4[i * k + j] - P5[i * k + j]; // C22 = P1 - P3 - P4 - P5
+                B22_pad[r * m2 + c] = B[(r + i1) * ldb + c + m1];
+            }
+
+            for (; c < m1; ++c) {
+                // Only matrices with m1 columns can be accesed here (B11, B21)
+                S2[r * m1 + c] = B[r * ldb + c];                          // S2 = B11 (+ B12)
+                S4[r * m1 + c] = B[(r + i1) * ldb + c];                   // S4 = B21 (+ B22)
+                S6[r * m1 + c] = B[r * ldb + c];                          // S6 = B11 (+ B22)
+                                                                          // S7 has m2 columns, so is ommited
+                S10[r * m1 + c] = B[(r + i1) * ldb + c] - B[r * ldb + c]; // S10 = B21 - B11
+
+            }
+        }
+        for (; r < i1; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // Only matrices with i1 rows can be accesed here (B11, B12)
+                S2[r * m1 + c] = B[r * ldb + c] + B[r * ldb + c + m1]; // S2 = B11 + B12
+                                                                       // S4 has i2 rows, so is ommited
+                S6[r * m1 + c] = B[r * ldb + c];                       // S6 = B11 (+ B22)
+                S7[r * m2 + c] = B[r * ldb + c + m1];                  // S7 = B12 (- B22)
+                S10[r * m1 + c] = - B[r * ldb + c];                    // S10 = (B21) - B11
+
+                B22_pad[r * m2 + c] = 0;
+            }
+
+            for (; c < m1; ++c) {
+                // Only matrices with i1 rows and m1 columns can be accesed (B11)
+                S2[r * m1 + c] = B[r * ldb + c];    // S2 = B11 (+ B12)
+                                                    // S4 has i2 rows, so is ommited
+                S6[r * m1 + c] = B[r * ldb + c];    // S6 = B11 (+ B22)
+                                                    // S7 has m2 columns, so is ommited
+                S10[r * m1 + c] = - B[r * ldb + c]; // S10 = (B21) - B11
             }
         }
 
-        free(P1);
-        free(P2);
-        free(P3);
-        free(P4);
-        free(P5);
-        free(P6);
-        free(P7);
+        _strassen(S1, i1, S2, m1, P1, m1, n1, i1, m1);       // P1 = S1 * S2
+        _strassen(S3, i2, S4, m1, P2, m1, n1, i2, m1);       // P2 = S3 * S4
+        _strassen(S5, i1, S6, m1, P3, m1, n1, i1, m1);       // P3 = S5 * S6
+        _strassen(A, lda, S7, m2, P4, m2, n1, i1, m2);       // P4 = A11 * S7
+        _strassen(S8, i1, B, ldb, P5, m1, n2, i1, m1);       // P5 = S8 * B11
+        _strassen(S9, i1, B22_pad, m2, P6, m2, n1, i1, m2);  // P6 = S9 * B22
+        _strassen(A22_pad, i1, S10, m1, P7, m1, n2, i1, m1); // P7 = A22 * S10
 
+        // Reconstructing C
+        r = 0;
+        for (; r < n2; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // All matrices can be accessed here 
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c] - P6[r * m2 + c] - P7[r * m1 + c];           // C11 = P2 + P3 - P6 - P7
+                C[r * ldc + c + m1] = P4[r * m2 + c] + P6[r * m2 + c];                                        // C12 = P4 + P6
+                C[(r + n1) * ldc + c] = P5[r * m1 + c] + P7[r * m1 + c];                                      // C21 = P5 + P7
+                C[(r + n1) * ldc + c + m1] = P1[r * m1 + c] - P3[r * m1 + c] - P4[r * m2 + c] - P5[r * m1 + c]; // C22 = P1 - P3 - P4 - P5
+            }
+            for (; c < m1; ++c) {
+                // Only matrices with m1 columns can be accessed here (C11, C21)
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c] - P7[r * m1 + c]; // C11 = P2 + P3 (- P6) - P7
+                                                                                   // C12 only has m2 columns, so is ommited 
+                C[(r + n1) * ldc + c] = P5[r * m1 + c] + P7[r * m1 + c];           // C21 = P5 + P7
+                                                                                   // C22 only has m2 columns, so is ommited
+            }
+        }
+        for (; r < n1; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // Only matrices with n1 rows can be accessed here (C11, C12)
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c] - P6[r * m2 + c]; // C11 = P2 + P3 - P6 (- P7)
+                C[r * ldc + c + m1] = P4[r * m2 + c] + P6[r * m2 + c];             // C12 = P4 + P6
+                                                                                   // C21 only has n2 rows, so is ommited
+                                                                                   // C22 only has n2 rows, so is ommited
+            }
+            for (; c < m1; ++c) {
+                // Only matrices with n1 rows and m1 columns can be accessed here (C11)
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c]; // C11 = P2 + P3 (- P6 - P7)
+            }
+        }
+
+        // Free allocated arrays
         free(S1);
         free(S2);
         free(S3);
@@ -1130,10 +1242,16 @@ void _strassen(const float *restrict A, const float *restrict B, float *restrict
         free(S9);
         free(S10);
 
-        free(A11);
-        free(A22);
-        free(B11);
-        free(B22);
+        free(P1);
+        free(P2);
+        free(P3);
+        free(P4);
+        free(P5);
+        free(P6);
+        free(P7);
+
+        free(A22_pad);
+        free(B22_pad);
     }
 }
 
@@ -1152,22 +1270,23 @@ mat *mat_mult_strassen(const mat *left, const mat *right, err *error) {
         return NULL;
     };
 
-    mat *C = mat_new(left->num_rows, right->num_cols);
+    mat *res = mat_new(left->num_rows, right->num_cols);
 
-    if (C == NULL) {
+    if (res == NULL) {
         if (error != NULL) {
             *error = ALLOCATION_FAILED;
         }
         return NULL;
     }
 
-    _strassen(left->data, right->data, C->data, left->num_rows);
+    _strassen(left->data, left->num_cols, right->data, right->num_cols, res->data, res->num_cols, left->num_rows, left->num_cols, right->num_cols);
 
     if (error != NULL) {
         *error = OK;
     }
-    return C;
+    return res;
 }
+
 
 size_t transposition_permutation(size_t idx, size_t num_rows, size_t num_cols) {
     if (idx == num_rows * num_cols - 1) {
@@ -1640,6 +1759,7 @@ mat *mat_rref(const mat *matrix, err *error) {
 // ************************************************************************************
 
 
+
 // ************************************************************************************
 //
 // deprecated
@@ -1689,7 +1809,7 @@ mat *mat_rref(const mat *matrix, err *error) {
 
 /*
 #TODO : SIMD for matrix addition (in place), matrix subtraction (in place)               - DONE
-#TODO : SIMD for Gauss elimination -- probably very hard, study multilication case more
+#TODO : SIMD for Gauss elimination -- probably very hard, study multilication case more 
 #TODO : Support for complex numbers: use vcmlaq_f32() for complex multiply-accumulate 
 #TODO : Implement Strassen's algorithm for matrix multiplication                         - DONE
 #TODO : Decompositions (LU, )
