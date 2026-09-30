@@ -4,7 +4,7 @@
 #define LINALG_NO_SIMD
 
 #define EPSILON 0.000000000000001
-#define STRASSEN_THRESHHOLD 16
+#define STRASSEN_THRESHHOLD 32
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -41,13 +41,20 @@ typedef struct {
     float *base;
     size_t capacity;
     size_t offset;
-} arena_t;
+} arena;
 
-float *_arena_alloc_unsafe(arena_t *arena, size_t count) {
+float *_arena_alloc_unsafe(arena *arena, size_t count) {
     float *p = arena->base + arena->offset;
     arena->offset += count;
     return p;
 }
+
+typedef struct {
+    mat *L;
+    mat *U;
+    mat *P;
+    size_t num_permutations;
+} lup_res;
 
 // ************************************************************************************
 //
@@ -61,6 +68,7 @@ typedef enum {
     ALLOCATION_FAILED,
     OUT_OF_BOUNDS,
     DIMENSION_MISMATCH,
+    SINGULAR,
 } err;
 
 const char *err_string(const err *error) {
@@ -75,6 +83,8 @@ const char *err_string(const err *error) {
             return "Index out of bounds";
         case DIMENSION_MISMATCH:
             return "Dimensions do not match";
+        case SINGULAR:
+            return "Matrix is singular";
         default:
             return "Unkown error";
     }
@@ -82,7 +92,7 @@ const char *err_string(const err *error) {
 
 void err_print_fmt(const char *err_str, const char *d_fmt) {
     if (err_str == NULL) {
-        fprintf(stdout, "Error string is NULL \n");
+        fprintf(stdout, d_fmt, "Error string is NULL \n");
         return;
     }
 
@@ -90,7 +100,7 @@ void err_print_fmt(const char *err_str, const char *d_fmt) {
 }
 
 void err_print(const char *err_str) {
-    err_print_fmt(err_str, "%s\n");
+    err_print_fmt(err_str, "%s \n");
 }
 
 // ************************************************************************************
@@ -225,6 +235,36 @@ mat *mat_cp(const mat *matrix, err *error) {
     memcpy(new->data, matrix->data, matrix->num_rows * matrix->num_cols * sizeof(*matrix->data));
 
     return new;
+}
+
+lup_res *lup_new(mat *L, mat *U, mat *P, size_t num_permutations) {
+    if (L == NULL || U == NULL || P == NULL) {
+        return NULL;
+    }
+
+    lup_res *r = malloc(sizeof(*r));
+
+    if (r == NULL) {
+        return NULL;
+    }
+
+    r->L = L;
+    r->U = U;
+    r->P = P;
+    r->num_permutations = num_permutations;
+
+    return r;
+}
+
+void lup_free(lup_res *lup) {
+    if (lup == NULL) {
+        return;
+    }
+
+    mat_free(lup->L);
+    mat_free(lup->U);
+    mat_free(lup->P);
+    free(lup);
 }
 
 // ************************************************************************************
@@ -378,6 +418,21 @@ mat *mat_col_get(const mat *matrix, size_t j, err *error) {
         *error = OK;
     }
     return col;
+}
+
+void mat_diag_set(mat *matrix, float f, err *error) {
+    if (matrix == NULL) {
+        if (error != NULL) {
+            *error = NULL_ARGUMENT;
+        }
+        return;
+    }
+
+    size_t n = (matrix->num_rows < matrix->num_cols) ? matrix->num_rows : matrix->num_cols;
+
+    for (size_t i = 0; i < n; ++i) {
+        matrix->data[i * matrix->num_cols + i] = f;
+    }
 }
 
 // ************************************************************************************
@@ -1033,7 +1088,6 @@ mat *mat_mult_strassen_arena(const mat *left, const mat *right, err *error) {
 
 */
 
-
 void _strassen(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, size_t n, size_t i, size_t m) {
     /*
     A represents an n by i matrix
@@ -1286,7 +1340,6 @@ mat *mat_mult_strassen(const mat *left, const mat *right, err *error) {
     }
     return res;
 }
-
 
 size_t transposition_permutation(size_t idx, size_t num_rows, size_t num_cols) {
     if (idx == num_rows * num_cols - 1) {
@@ -1758,7 +1811,78 @@ mat *mat_rref(const mat *matrix, err *error) {
 //
 // ************************************************************************************
 
+lup_res *mat_lup_solve(const mat *A, err *error) {
+    if (A == NULL) {
+        if (error != NULL) {
+            *error = NULL_ARGUMENT;
+        }
+        return NULL;
+    }
 
+    if (A->num_rows != A->num_cols) {
+        if (error != NULL) {
+            *error = DIMENSION_MISMATCH;
+        }
+        return NULL;
+    }
+
+    size_t n = A->num_rows;
+
+    mat *L = mat_new(n, n);
+    mat *U = mat_cp_unsafe(A);  
+    mat *P = mat_id(n);
+
+    if (L == NULL || U == NULL || P == NULL) {
+        if (error != NULL) {
+            *error = ALLOCATION_FAILED;
+        }
+        mat_free(L);
+        mat_free(U);
+        mat_free(P);
+        return NULL;
+    }
+
+    size_t num_permutations = 0;
+
+    for (size_t k = 0; k < n - 1; ++k) {
+
+        int pivot = _mat_find_pivot_row(U, k, k);
+
+        if (pivot < 0) {
+            if (error != NULL) {
+                *error = SINGULAR;
+            }
+            mat_free(L);
+            mat_free(U);
+            mat_free(P);
+            return NULL;
+        }
+
+        if (pivot != k) {
+            mat_row_swap_r_unsafe(L, k, pivot);
+            mat_row_swap_r_unsafe(U, k, pivot);
+            mat_row_swap_r_unsafe(P, k, pivot);
+            ++num_permutations;
+        }
+
+        for (size_t i = k + 1; i < n; ++i) {
+            float f = U->data[i * n + k] / U->data[k * n + k];
+            L->data[i * n + k] = f;
+            for (size_t j = k; j < n; ++j) {
+                U->data[i * n + j] -= f * U->data[k * n + j];
+            }
+
+        }
+    }
+
+    mat_diag_set(L, 1, NULL);
+
+    if (error != NULL) {
+        *error = OK;
+    }
+
+    return lup_new(L, U, P, num_permutations);
+}
 
 // ************************************************************************************
 //
@@ -1808,10 +1932,8 @@ mat *mat_rref(const mat *matrix, err *error) {
 #endif 
 
 /*
-#TODO : SIMD for matrix addition (in place), matrix subtraction (in place)               - DONE
 #TODO : SIMD for Gauss elimination -- probably very hard, study multilication case more 
 #TODO : Support for complex numbers: use vcmlaq_f32() for complex multiply-accumulate 
-#TODO : Implement Strassen's algorithm for matrix multiplication                         - DONE
 #TODO : Decompositions (LU, )
 
 */
