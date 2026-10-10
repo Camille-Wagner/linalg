@@ -1,20 +1,28 @@
 #ifndef LINALG_H
 #define LINALG_H
 
-#define LINALG_NO_SIMD
-
+#ifndef EPSILON
 #define EPSILON 0.000000000000001
-#define STRASSEN_THRESHHOLD 32
+#endif
+
+#ifndef STRASSEN_RECURSION_THRESHHOLD
+#define STRASSEN_RECURSION_THRESHHOLD 64
+#endif
+
+#ifndef STRASSEN_PARALLEL_THRESHHOLD
+#define STRASSEN_PARALLEL_THRESHHOLD 256
+#endif
+
+#ifndef STRASSEN_MAX_PARALLEL_DEPTH
+#define STRASSEN_MAX_PARALLEL_DEPTH 3
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdbool.h>
 #include <math.h>
 #include <string.h>
-#include <time.h>
 
 #ifdef LINALG_USE_NEON
-#undef LINALG_NO_SIMD
 #include <arm_neon.h>
 #endif
 
@@ -22,7 +30,7 @@
 #include <complex.h>
 #define scalar_t complex 
 #else
-#define scalar_t float 
+#define scalar_t double 
 #endif
 
 // ************************************************************************************
@@ -36,25 +44,6 @@ typedef struct {
     size_t num_cols;
     float *data;
 } mat;
-
-typedef struct {
-    float *base;
-    size_t capacity;
-    size_t offset;
-} arena;
-
-float *_arena_alloc_unsafe(arena *arena, size_t count) {
-    float *p = arena->base + arena->offset;
-    arena->offset += count;
-    return p;
-}
-
-typedef struct {
-    mat *L;
-    mat *U;
-    mat *P;
-    size_t num_permutations;
-} lup_res;
 
 // ************************************************************************************
 //
@@ -131,7 +120,7 @@ void mat_print(const mat *matrix) {
 
 // ************************************************************************************
 //
-// Matrix Allocation and Destruction
+// Matrix Allocation, Copying and Destruction
 //
 // ************************************************************************************
 
@@ -184,7 +173,7 @@ mat *mat_id(size_t size) {
     return id;
 }
 
-float rand_interval(float min, float max) {
+float _rand_interval(float min, float max) {
     float d = (float) rand() / (float) RAND_MAX;
     return min + d * (max - min);
 }
@@ -197,13 +186,13 @@ mat *mat_rnd(size_t num_rows, size_t num_cols, float min, float max) {
     }
 
     for (size_t idx = 0; idx < m->num_rows * m->num_cols; ++idx) {
-        m->data[idx] = rand_interval(min, max);
+        m->data[idx] = _rand_interval(min, max);
     }
 
     return m;
 }
 
-mat *mat_cp_unsafe(const mat *matrix) {
+mat *_mat_cp_unsafe(const mat *matrix) {
     mat *new = mat_new(matrix->num_rows, matrix->num_cols);
 
     if (new == NULL) {
@@ -237,58 +226,28 @@ mat *mat_cp(const mat *matrix, err *error) {
     return new;
 }
 
-lup_res *lup_new(mat *L, mat *U, mat *P, size_t num_permutations) {
-    if (L == NULL || U == NULL || P == NULL) {
-        return NULL;
-    }
-
-    lup_res *r = malloc(sizeof(*r));
-
-    if (r == NULL) {
-        return NULL;
-    }
-
-    r->L = L;
-    r->U = U;
-    r->P = P;
-    r->num_permutations = num_permutations;
-
-    return r;
-}
-
-void lup_free(lup_res *lup) {
-    if (lup == NULL) {
-        return;
-    }
-
-    mat_free(lup->L);
-    mat_free(lup->U);
-    mat_free(lup->P);
-    free(lup);
-}
-
 // ************************************************************************************
 //
 // Matrix Equality
 //
 // ************************************************************************************
 
-bool mat_eq(const mat *left, const mat *right) {
+int mat_eq(const mat *left, const mat *right) {
     if (left == NULL || right == NULL) {
-        return false;
+        return 0;
     }
 
     if (left->num_rows != right->num_rows || left->num_cols != right->num_cols) {
-        return false;
+        return 0;
     }
 
     for (size_t idx = 0; idx < left->num_rows * left->num_cols; ++idx) {
         if (fabs(left->data[idx] - right->data[idx]) > EPSILON) {
-            return false;
+            return 0;
         }
     }
 
-    return true;
+    return 1;
 }
 
 // ************************************************************************************
@@ -564,7 +523,7 @@ mat *mat_add(const mat *left, const mat *right, err *error) {
         return NULL;
     };
 
-    #ifdef LINALG_USE_NEON
+    #if defined(LINALG_USE_NEON)
     
     size_t n = left->num_rows;
     size_t m = left->num_cols;
@@ -595,9 +554,7 @@ mat *mat_add(const mat *left, const mat *right, err *error) {
 
     return C;
 
-    #endif
-
-    #ifdef LINALG_NO_SIMD
+    #else
 
     mat *res = mat_new(left->num_rows, left->num_cols);
 
@@ -616,6 +573,7 @@ mat *mat_add(const mat *left, const mat *right, err *error) {
         *error = OK;
     }
     return res;
+
     #endif
 }
 
@@ -634,7 +592,7 @@ void mat_add_r(mat *left, const mat *right, err *error) {
         return;
     };
 
-    #ifdef LINALG_USE_NEON
+    #if defined(LINALG_USE_NEON)
     size_t n = left->num_rows;
     size_t m = left->num_cols;
 
@@ -650,12 +608,11 @@ void mat_add_r(mat *left, const mat *right, err *error) {
         left->data[i] += right->data[i];
     }
 
-    #endif
-
-    #ifdef LINALG_NO_SIMD
+    #else
     for (size_t idx = 0; idx < left->num_rows * left->num_cols; ++idx) {
         left->data[idx] += right->data[idx];
     }
+
     #endif
 
     if (error != NULL) {
@@ -678,7 +635,7 @@ mat *mat_sub(const mat *left, const mat *right, err *error) {
         return NULL;
     };
 
-    #ifdef LINALG_USE_NEON
+    #if defined(LINALG_USE_NEON)
 
     size_t n = left->num_rows;
     size_t m = left->num_cols;
@@ -709,9 +666,8 @@ mat *mat_sub(const mat *left, const mat *right, err *error) {
 
     return C;
 
-    #endif
+    #else
 
-    #ifdef LINALG_NO_SIMD
     mat *res = mat_new(left->num_rows, left->num_cols);
 
     if (res == NULL) {
@@ -748,7 +704,7 @@ void mat_sub_r(mat *left, const mat *right, err *error) {
         return;
     };
 
-    #ifdef LINALG_USE_NEON
+    #if defined(LINALG_USE_NEON)
     size_t n = left->num_rows;
     size_t m = left->num_cols;
 
@@ -764,9 +720,8 @@ void mat_sub_r(mat *left, const mat *right, err *error) {
         left->data[i] -= right->data[i];
     }
 
-    #endif
+    #else
 
-    #ifdef LINALG_NO_SIMD
     for (size_t idx = 0; idx < left->num_rows * left->num_cols; ++idx) {
         left->data[idx] -= right->data[idx];
     }  
@@ -774,6 +729,7 @@ void mat_sub_r(mat *left, const mat *right, err *error) {
     if (error != NULL) {
         *error = OK;
     }
+
     #endif
 }
 
@@ -821,7 +777,7 @@ void mat_scalar_mult_r(mat *matrix, float scalar, err *error) {
     }
 }
 
-mat *mat_mult(const mat *left, const mat *right, err *error) {
+mat *mat_mul_n3(const mat *left, const mat *right, err *error) {
     if (left == NULL || right == NULL) {
         if (error != NULL) {
             *error = NULL_ARGUMENT;
@@ -829,266 +785,150 @@ mat *mat_mult(const mat *left, const mat *right, err *error) {
         return NULL;
     }
 
-    if (left->num_cols != right->num_rows) {
+    if (left->num_cols != right->num_rows) { // || out->num_rows != left->num_rows || out->num_cols != right->num_cols
         if (error != NULL) {
             *error = DIMENSION_MISMATCH;
         }
         return NULL;
     };
+
+    mat *out = mat_new(left->num_rows, right->num_cols);
+
+    if (out == NULL) {
+        if (error != NULL) {
+            *error = ALLOCATION_FAILED;
+        }
+        return NULL;
+    }
     
-    #ifdef LINALG_USE_NEON
+    #if defined(LINALG_USE_NEON)
 
     size_t n = left->num_rows; 
-    size_t k = left->num_cols; 
+    size_t i = left->num_cols; 
     size_t m = right->num_cols;
 
-    mat *C = mat_new(n, m);  
-    if (C == NULL) {
-        if (error != NULL) *error = ALLOCATION_FAILED;
-        return NULL;
-    }
+    float *A = left->data;
+    float *B = right->data;
+    float *C = out->data;  
 
-    size_t i = 0;
-    for (; i +4 <= n; i += 4) {
-        size_t j = 0;
-        for (; j + 4 <= m; j += 4) {
-            float32x4_t acc0 = vmovq_n_f32(0.0f); // will hold C[i,   j:j+3]
-            float32x4_t acc1 = vmovq_n_f32(0.0f); // will hold C[i+1, j:j+3]
-            float32x4_t acc2 = vmovq_n_f32(0.0f); // will hold C[i+2, j:j+3]
-            float32x4_t acc3 = vmovq_n_f32(0.0f); // will hold C[i+3, j:j+3]
+    size_t r = 0;
+    for (; r + 4 <= n; r += 4) {
+        const float *A0 = A + r * i;
+        const float *A1 = A + (r + 1) * i;
+        const float *A2 = A + (r + 2) * i;
+        const float *A3 = A + (r + 3) * i;
 
-            for (size_t p = 0; p < k; ++p) {
-                // one B row-slice - B[p, j:j+3] 
-                float32x4_t b_row = vld1q_f32(right->data + p * m + j); 
+        float *C0 = C + r * m;
+        float *C1 = C + (r + 1) * m;
+        float *C2 = C + (r + 2) * m;
+        float *C3 = C + (r + 3) * m;
 
-                acc0 = vfmaq_n_f32(acc0, b_row, left->data[i * k + p]);        // acc0 += b_row * A[i][p]
-                acc1 = vfmaq_n_f32(acc1, b_row, left->data[(i + 1) * k + p]);  // acc1 += b_row * A[i+1][p]
-                acc2 = vfmaq_n_f32(acc2, b_row, left->data[(i + 2) * k + p]);  // acc2 += b_row * A[i+2][p]
-                acc3 = vfmaq_n_f32(acc3, b_row, left->data[(i + 3) * k + p]);  // acc3 += b_row * A[i+3][p]
+        size_t c = 0;
+        for(; c + 4 <= m; c += 4) {
+            float32x4_t acc0 = vmovq_n_f32(0.0f); // will hold C[r,   c:c+3]
+            float32x4_t acc1 = vmovq_n_f32(0.0f); // will hold C[r+1, c:c+3]
+            float32x4_t acc2 = vmovq_n_f32(0.0f); // will hold C[r+2, c:c+3]
+            float32x4_t acc3 = vmovq_n_f32(0.0f); // will hold C[r+3, c:c+3]
 
+            for (size_t k = 0; k < i; ++k) {
+                // one B row-slice - B[k, c:c+3]
+                float32x4_t b_row = vld1q_f32(B + k * m + c); 
+
+                acc0 = vfmaq_n_f32(acc0, b_row, A0[k]);  // acc0 += b_row * A[r][k]
+                acc1 = vfmaq_n_f32(acc1, b_row, A1[k]);  // acc1 += b_row * A[r+1][k]
+                acc2 = vfmaq_n_f32(acc2, b_row, A2[k]);  // acc2 += b_row * A[r+2][k]
+                acc3 = vfmaq_n_f32(acc3, b_row, A3[k]);  // acc3 += b_row * A[r+3][k]
             }
-            vst1q_f32(C->data + i * m + j, acc0);
-            vst1q_f32(C->data + (i + 1) * m + j, acc1);
-            vst1q_f32(C->data + (i + 2) * m + j, acc2);
-            vst1q_f32(C->data + (i + 3) * m + j, acc3);
+            vst1q_f32(C0 + c, acc0);
+            vst1q_f32(C1 + c, acc1);
+            vst1q_f32(C2 + c, acc2);
+            vst1q_f32(C3 + c, acc3);
         }
         // leftover columns (m % 4 != 0) for this row-block: scalar, one element at a time
-        for (; j < m; ++j) {
-            for (size_t r = 0; r < k; ++r) {
-                float sum = 0.0f;
-                for (size_t p = 0; p < k; ++p) {
-                    sum += left->data[(i + r) * k + p] * right->data[p * m + j];
-                }
-                C->data[(i + r) * m + j] = sum;
+        for (; c < m; ++c) {
+            float s0 = 0.0;
+            float s1 = 0.0;
+            float s2 = 0.0;
+            float s3 = 0.0;
+
+            for (size_t k = 0; k < i; ++k) {
+                float b = B[k * m + c];
+                s0 += b * A0[k];
+                s1 += b * A1[k];
+                s2 += b * A2[k];
+                s3 += b * A3[k];
             }
+
+            C0[c] = s0;
+            C1[c] = s1;
+            C2[c] = s2;
+            C3[c] = s3;
         }
     }
+
     // leftover rows (n % 4 != 0): fall back to the single-direction (1-row) routine from before
-    for (; i < n; ++i) {
-        size_t j = 0;
-        for (; j + 4 <= m; j += 4) {
+    for (; r < n; ++r) {
+        const float *A_row = A + r * i;
+        float *C_row = C + r * m;
+
+        size_t c = 0;
+        for (; c + 4 <= m; c += 4) {
             float32x4_t acc = vmovq_n_f32(0.0f);
 
-            for (size_t p = 0; p < k; ++p) {
-                float32x4_t b_row = vld1q_f32(right->data + p * m + j);
-                acc = vfmaq_n_f32(acc, b_row, left->data[i * k + p]);
+            for (size_t k = 0; k < i; ++k) {
+                float32x4_t b_row = vld1q_f32(B + k * m + c);
+                acc = vfmaq_n_f32(acc, b_row, A_row[k]);
             }
-            vst1q_f32(C->data + i * m + j, acc);
+            vst1q_f32(C_row + c, acc);
         }
-        for (; j < m; ++j) {
+        for (; c < m; ++c) {
             float sum = 0.0f;
 
-            for (size_t p = 0; p < k; ++p) {
-                sum += left->data[i * k + p] * right->data[p * m + j];
+            for (size_t k = 0; k < i; ++k) {
+                sum += A_row[k] * B[k * m + c];
             }
-            C->data[i * m + j] = sum;
+            C_row[c] = sum;
         }
     }
 
     if (error != NULL) {
         *error = OK;
     }
-    return C;
+    return out;
 
-    #endif
+    #else
 
-    #ifdef LINALG_NO_SIMD
+    size_t n = left->num_rows; 
+    size_t i = left->num_cols; 
+    size_t m = right->num_cols;
 
-    mat *res = mat_new(left->num_rows, right->num_cols);
+    float *A = left->data;
+    float *B = right->data;
+    float *C = out->data;  
 
-    if (res == NULL) {
-        if (error != NULL) {
-            *error = ALLOCATION_FAILED;
+    for (size_t r = 0; r < n; ++r) {
+        float *C_row = C + r * m;
+        for (size_t c = 0; c < m; ++c) {
+            C_row[c] = 0.0f;
         }
-        return NULL;
-    }
-
-    for (size_t i = 0; i < res->num_rows; ++i) {
-        for (size_t j = 0; j < res->num_cols; ++j) {
-            float sum = 0.0;
-            for (size_t k = 0; k < left->num_cols; ++k) {
-                sum += left->data[i * left->num_cols + k] * right->data[k * right->num_cols + j];
+        for (size_t k = 0; k < i; ++k) {
+            float a_val = A[r * i + k];
+            const float *B_row = B + k * m;
+            for (size_t c = 0; c < m; ++c) {
+                C_row[c] += a_val * B_row[c];
             }
-            res->data[i * res->num_cols + j] = sum;
         }
     }
-
 
     if (error != NULL) {
         *error = OK;
     }
-    return res;
+    return out;
+
     #endif
 }
 
-/*
-void _strassen_arena(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, arena_t *arena, size_t n) {
-    if (n <= STRASSEN_THRESHHOLD) {
-        for (size_t i = 0; i < n; ++i) {
-            size_t k = 0;
-            float a = A[i * lda + k];
-            for (size_t j = 0; j < n; ++j) {
-                    C[i * ldc + j] = a * B[k * ldb + j];
-                }
-            for (size_t k = 1; k < n; ++ k) {
-                float a = A[i * lda + k];
-                for (size_t j = 0; j < n; ++j) {
-                    C[i * ldc + j] += a * B[k * ldb + j];
-                }
-            }
-        }
-    }
-
-    else {
-        size_t k = n/2;
-        size_t save_offset = arena->offset;
-
-        float *P1 = _arena_alloc_unsafe(arena, k * k);
-        float *P2 = _arena_alloc_unsafe(arena, k * k);
-        float *P3 = _arena_alloc_unsafe(arena, k * k);
-        float *P4 = _arena_alloc_unsafe(arena, k * k);
-        float *P5 = _arena_alloc_unsafe(arena, k * k);
-        float *P6 = _arena_alloc_unsafe(arena, k * k);
-        float *P7 = _arena_alloc_unsafe(arena, k * k);
-
-        float *S1 = _arena_alloc_unsafe(arena, k * k);
-        float *S2 = _arena_alloc_unsafe(arena, k * k);
-        float *S3 = _arena_alloc_unsafe(arena, k * k);
-        float *S4 = _arena_alloc_unsafe(arena, k * k);
-        float *S5 = _arena_alloc_unsafe(arena, k * k);
-        float *S6 = _arena_alloc_unsafe(arena, k * k);
-        float *S7 = _arena_alloc_unsafe(arena, k * k);
-        float *S8 = _arena_alloc_unsafe(arena, k * k);
-        float *S9 = _arena_alloc_unsafe(arena, k * k);
-        float *S10 = _arena_alloc_unsafe(arena, k * k);
-
-        // Pointers to the start of their respective slice in their parent buffer
-        const float *A11 = A;             
-        const float *A12 = A + k;
-        const float *A21 = A + k * lda;
-        const float *A22 = A + k * lda + k;
-
-        const float *B11 = B;              
-        const float *B12 = B + k;
-        const float *B21 = B + k * ldb;
-        const float *B22 = B + k * ldb + k;
-
-        float *C11 = C;              
-        float *C12 = C + k;
-        float *C21 = C + k * ldc;    
-        float *C22 = C + k * ldc + k;
-
-        for (size_t i = 0; i < k; ++i) {
-            for (size_t j = 0; j < k; ++j) {
-                S1[i * k + j]  = A11[i * lda + j] + A21[i * lda + j]; // A11 + A21
-                S3[i * k + j]  = A12[i * lda + j] + A22[i * lda + j]; // A12 + A22
-                S5[i * k + j]  = A11[i * lda + j] - A22[i * lda + j]; // A11 - A22
-                S8[i * k + j]  = A21[i * lda + j] + A22[i * lda + j]; // A21 + A22
-                S9[i * k + j]  = A11[i * lda + j] + A12[i * lda + j]; // A11 + A12
-
-                S2[i * k + j]  = B11[i * ldb + j] + B12[i * ldb + j]; // B11 + B12
-                S4[i * k + j]  = B21[i * ldb + j] + B22[i * ldb + j]; // B21 + B22
-                S6[i * k + j]  = B11[i * ldb + j] + B22[i * ldb + j]; // B11 + B22
-                S7[i * k + j]  = B12[i * ldb + j] - B22[i * ldb + j]; // B12 - B22
-                S10[i * k + j] = B21[i * ldb + j] - B11[i * ldb + j]; // B21 - B11
-            }
-        }
-
-        _strassen_arena(S1, k, S2, k, P1, k, arena, k);     // (A11 + A21) * (B11 + B12)
-        _strassen_arena(S3, k, S4, k, P2, k, arena, k);     // (A12 + A22) * (B21 + B22)
-        _strassen_arena(S5, k, S6, k, P3, k, arena, k);     // (A11 - A22) * (B11 + B22)
-        _strassen_arena(A11, lda, S7, k, P4, k, arena, k);  // A11 * (B12 - B22)
-        _strassen_arena(S8, k, B11, ldb, P5, k, arena, k);  // (A21 + A22) * B11
-        _strassen_arena(S9, k, B22, ldb, P6, k, arena, k);  // (A11 + A12) * B22
-        _strassen_arena(A22, lda, S10, k, P7, k, arena, k); // A22 * (B21 - B11)
-
-       for (size_t i = 0; i < k; ++i) {
-            for (size_t j = 0; j < k; ++j) {
-                C11[i * ldc + j] = P2[i * k + j] + P3[i * k + j] - P6[i * k + j] - P7[i * k + j]; // C11 = P2 + P3 - P6 - P7
-                C12[i * ldc + j] = P4[i * k + j] + P6[i * k + j];                                 // C12 = P4 + P6
-                C21[i * ldc + j] = P5[i * k + j] + P7[i * k + j];                                 // C21 = P5 + P7
-                C22[i * ldc + j] = P1[i * k + j] - P3[i * k + j] - P4[i * k + j] - P5[i * k + j]; // C22 = P1 - P3 - P4 - P5
-            }
-       }
-
-        arena->offset = save_offset;
-    }
-}
-
-size_t _strassen_arena_size(size_t n) {
-    if (n < STRASSEN_THRESHHOLD) {
-        return 0;
-    }
-    size_t total = 0;
-    while (n > STRASSEN_THRESHHOLD) {
-        size_t k = n / 2;
-        total += 17 * k * k;
-        n = k;
-    }
-    return total;
-}
-
-mat *mat_mult_strassen_arena(const mat *left, const mat *right, err *error) {
-    if (left == NULL || right == NULL) {
-        if (error != NULL) {
-            *error = NULL_ARGUMENT;
-        }
-        return NULL;
-    }
-
-    if (left->num_cols != right->num_rows) {
-        if (error != NULL) {
-            *error = DIMENSION_MISMATCH;
-        }
-        return NULL;
-    };
-
-    mat *C = mat_new(left->num_rows, left->num_rows);
-
-    if (C == NULL) {
-        if (error != NULL) {
-            *error = ALLOCATION_FAILED;
-        }
-        return NULL;
-    }
-
-    size_t n = left->num_rows; // assume A and B are square matrices with a power of two dimensions
-    size_t arena_capacity = _strassen_arena_size(n);
-
-    arena_t arena = { .base = malloc(arena_capacity * sizeof(float)), .capacity = arena_capacity, .offset = 0};
-
-    if (arena.base == NULL) {
-        return NULL;
-    }
-
-    _strassen_arena(left->data, n, right->data, n, C->data, n, &arena, n);
-
-    return C;
-}
-
-*/
-
-void _strassen(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, size_t n, size_t i, size_t m) {
+void _strassen_alloc(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, size_t n, size_t i, size_t m) {
     /*
     A represents an n by i matrix
     A may be a view into a larger row-major matrix with leading dimension lda
@@ -1100,7 +940,7 @@ void _strassen(const float *restrict A, size_t lda, const float *restrict B, siz
     C may be a view into a larger row-major matrix with leading dimension ldc
     */
 
-    if (n <= STRASSEN_THRESHHOLD || i <= STRASSEN_THRESHHOLD || m <= STRASSEN_THRESHHOLD) {
+    if (n <= STRASSEN_RECURSION_THRESHHOLD || i <= STRASSEN_RECURSION_THRESHHOLD || m <= STRASSEN_RECURSION_THRESHHOLD) {
         for (size_t r = 0; r < n; ++r) {
             for (size_t c = 0; c < m; ++c) {
                 float sum = 0;
@@ -1242,13 +1082,13 @@ void _strassen(const float *restrict A, size_t lda, const float *restrict B, siz
             }
         }
 
-        _strassen(S1, i1, S2, m1, P1, m1, n1, i1, m1);       // P1 = S1 * S2
-        _strassen(S3, i2, S4, m1, P2, m1, n1, i2, m1);       // P2 = S3 * S4
-        _strassen(S5, i1, S6, m1, P3, m1, n1, i1, m1);       // P3 = S5 * S6
-        _strassen(A, lda, S7, m2, P4, m2, n1, i1, m2);       // P4 = A11 * S7
-        _strassen(S8, i1, B, ldb, P5, m1, n2, i1, m1);       // P5 = S8 * B11
-        _strassen(S9, i1, B22_pad, m2, P6, m2, n1, i1, m2);  // P6 = S9 * B22
-        _strassen(A22_pad, i1, S10, m1, P7, m1, n2, i1, m1); // P7 = A22 * S10
+        _strassen_alloc(S1, i1, S2, m1, P1, m1, n1, i1, m1);       // P1 = S1 * S2
+        _strassen_alloc(S3, i2, S4, m1, P2, m1, n1, i2, m1);       // P2 = S3 * S4
+        _strassen_alloc(S5, i1, S6, m1, P3, m1, n1, i1, m1);       // P3 = S5 * S6
+        _strassen_alloc(A, lda, S7, m2, P4, m2, n1, i1, m2);       // P4 = A11 * S7
+        _strassen_alloc(S8, i1, B, ldb, P5, m1, n2, i1, m1);       // P5 = S8 * B11
+        _strassen_alloc(S9, i1, B22_pad, m2, P6, m2, n1, i1, m2);  // P6 = S9 * B22
+        _strassen_alloc(A22_pad, i1, S10, m1, P7, m1, n2, i1, m1); // P7 = A22 * S10
 
         // Reconstructing C
         r = 0;
@@ -1309,7 +1149,7 @@ void _strassen(const float *restrict A, size_t lda, const float *restrict B, siz
     }
 }
 
-mat *mat_mult_strassen(const mat *left, const mat *right, err *error) {
+mat *mat_mult_strassen_alloc(const mat *left, const mat *right, err *error) {
     if (left == NULL || right == NULL) {
         if (error != NULL) {
             *error = NULL_ARGUMENT;
@@ -1333,7 +1173,365 @@ mat *mat_mult_strassen(const mat *left, const mat *right, err *error) {
         return NULL;
     }
 
-    _strassen(left->data, left->num_cols, right->data, right->num_cols, res->data, res->num_cols, left->num_rows, left->num_cols, right->num_cols);
+    _strassen_alloc(left->data, left->num_cols, right->data, right->num_cols, res->data, res->num_cols, left->num_rows, left->num_cols, right->num_cols);
+
+    if (error != NULL) {
+        *error = OK;
+    }
+    return res;
+}
+
+void _strassen_base(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, size_t n, size_t i, size_t m) {
+    /*
+    A represents an n by i matrix
+    A may be a view into a larger row-major matrix with leading dimension lda
+    
+    B represents an i by m matrix
+    B may be a view into a larger row-major matrix with leading dimension ldb
+    
+    C represenets an n by m matrix
+    C may be a view into a larger row-major matrix with leading dimension ldc
+    */
+    #if defined(LINALG_USE_NEON)
+
+    size_t r = 0;
+    for (; r + 4 <= n; r += 4) {
+        const float *A0 = A + r * lda;
+        const float *A1 = A + (r + 1) * lda;
+        const float *A2 = A + (r + 2) * lda;
+        const float *A3 = A + (r + 3) * lda;
+
+        float *C0 = C + r * ldc;
+        float *C1 = C + (r + 1) * ldc;
+        float *C2 = C + (r + 2) * ldc;
+        float *C3 = C + (r + 3) * ldc;
+
+        size_t c = 0;
+        for(; c + 4 <= m; c += 4) {
+            float32x4_t acc0 = vmovq_n_f32(0.0f); // will hold C[r,   c:c+3]
+            float32x4_t acc1 = vmovq_n_f32(0.0f); // will hold C[r+1, c:c+3]
+            float32x4_t acc2 = vmovq_n_f32(0.0f); // will hold C[r+2, c:c+3]
+            float32x4_t acc3 = vmovq_n_f32(0.0f); // will hold C[r+3, c:c+3]
+
+            for (size_t k = 0; k < i; ++k) {
+                // one B row-slice - B[k, c:c+3]
+                float32x4_t b_row = vld1q_f32(B + k * ldb + c); 
+
+                acc0 = vfmaq_n_f32(acc0, b_row, A0[k]);  // acc0 += b_row * A[r][k]
+                acc1 = vfmaq_n_f32(acc1, b_row, A1[k]);  // acc1 += b_row * A[r+1][k]
+                acc2 = vfmaq_n_f32(acc2, b_row, A2[k]);  // acc2 += b_row * A[r+2][k]
+                acc3 = vfmaq_n_f32(acc3, b_row, A3[k]);  // acc3 += b_row * A[r+3][k]
+            }
+            vst1q_f32(C0 + c, acc0);
+            vst1q_f32(C1 + c, acc1);
+            vst1q_f32(C2 + c, acc2);
+            vst1q_f32(C3 + c, acc3);
+        }
+        // leftover columns (m % 4 != 0) for this row-block: scalar, one element at a time
+        for (; c < m; ++c) {
+            float s0 = 0.0;
+            float s1 = 0.0;
+            float s2 = 0.0;
+            float s3 = 0.0;
+
+            for (size_t k = 0; k < i; ++k) {
+                float b = B[k * ldb + c];
+                s0 += b * A0[k];
+                s1 += b * A1[k];
+                s2 += b * A2[k];
+                s3 += b * A3[k];
+            }
+
+            C0[c] = s0;
+            C1[c] = s1;
+            C2[c] = s2;
+            C3[c] = s3;
+        }
+    }
+
+    // leftover rows (n % 4 != 0): fall back to the single-direction (1-row) routine from before
+    for (; r < n; ++r) {
+        const float *A_row = A + r * lda;
+        float *C_row = C + r * ldc;
+
+        size_t c = 0;
+        for (; c + 4 <= m; c += 4) {
+            float32x4_t acc = vmovq_n_f32(0.0f);
+
+            for (size_t k = 0; k < i; ++k) {
+                float32x4_t b_row = vld1q_f32(B + k * ldb + c);
+                acc = vfmaq_n_f32(acc, b_row, A_row[k]);
+            }
+            vst1q_f32(C_row + c, acc);
+        }
+        for (; c < m; ++c) {
+            float sum = 0.0f;
+
+            for (size_t k = 0; k < i; ++k) {
+                sum += A_row[k] * B[k * ldb + c];
+            }
+            C_row[c] = sum;
+        }
+    }
+
+    #else
+
+    for (size_t r = 0; r < n; ++r) {
+        float *C_row = C + r * ldc;
+        for (size_t c = 0; c < m; ++c) {
+            C_row[c] = 0.0f;
+        }
+        for (size_t k = 0; k < i; ++k) {
+            float a_val = A[r * lda + k];
+            const float *B_row = B + k * ldb;
+            for (size_t c = 0; c < m; ++c) {
+                C_row[c] += a_val * B_row[c];
+            }
+        }
+    }
+    #endif
+}
+
+void _strassen_serial(const float *restrict A, size_t lda, const float *restrict B, size_t ldb, float *restrict C, size_t ldc, size_t n, size_t i, size_t m, float *arena) {
+    /*
+    A represents an n by i matrix
+    A may be a view into a larger row-major matrix with leading dimension lda
+    
+    B represents an i by m matrix
+    B may be a view into a larger row-major matrix with leading dimension ldb
+    
+    C represenets an n by m matrix
+    C may be a view into a larger row-major matrix with leading dimension ldc
+    */
+
+    if (n <= STRASSEN_RECURSION_THRESHHOLD || i <= STRASSEN_RECURSION_THRESHHOLD || m <= STRASSEN_RECURSION_THRESHHOLD) {
+        _strassen_base(A, lda, B, ldb, C, ldc, n, i, m);
+    }
+    
+    else {
+        size_t n2 = n/2;
+        size_t n1 = n - n2;
+        size_t i2 = i/2;
+        size_t i1 = i - i2;
+        size_t m2 = m/2;
+        size_t m1 = m - m2;
+
+        float *arena_save = arena;
+
+        // A-side sums
+        float *S1 = arena; arena += n1 * i1;
+        float *S3 = arena; arena += n1 * i2;
+        float *S5 = arena; arena += n1 * i1;
+        float *S8 = arena; arena += n2 * i1;
+        float *S9 = arena; arena += n1 * i1;
+
+        // B-side sums
+        float *S2 = arena; arena += i1 * m1;
+        float *S4 = arena; arena += i2 * m1;
+        float *S6 = arena; arena += i1 * m1;
+        float *S7 = arena; arena += i1 * m2;
+        float *S10 = arena; arena += i1 * m1;
+
+        // Partitions
+        float *P1 = arena; arena += n1 * m1; 
+        float *P2 = arena; arena += n1 * m1;
+        float *P3 = arena; arena += n1 * m1;
+        float *P4 = arena; arena += n1 * m2; 
+        float *P5 = arena; arena += n2 * m1;
+        float *P6 = arena; arena += n1 * m2; 
+        float *P7 = arena; arena += n2 * m1;
+
+        // Padded containers 
+        float *A22_pad = arena; arena += n2 * i1;
+        float *B22_pad = arena; arena += i1 * m2; 
+
+        // Filling A-side sum matrices
+        size_t r = 0;
+        for (; r < n2; ++r) {
+            size_t c = 0;
+            for (; c < i2; ++c) {
+                // All matrices can be accessed here
+                S1[r * i1 + c] = A[r * lda + c] + A[(r + n1) * lda + c];             // S1 = A11 + A21
+                S3[r * i2 + c] = A[r * lda + c + i1] + A[(r + n1) * lda + c + i1];   // S3 = A12 + A22
+                S5[r * i1 + c] = A[r * lda + c] - A[(r + n1) * lda + c + i1];        // S5 = A11 - A22
+                S8[r * i1 + c] = A[(r + n1) * lda + c] + A[(r + n1) * lda + c + i1]; // S8 = A21 + A22
+                S9[r * i1 + c] = A[r * lda + c] + A[r * lda + c + i1];               // S9 = A11 + A12
+
+                A22_pad[r * i1 + c] = A[(r + n1) * lda + c + i1];
+            }
+
+            for (; c < i1; ++c) {
+                // Only matrices with i1 columns can be accesed here (A11, A21)
+                S1[r * i1 + c] = A[r * lda + c] + A[(r + n1) * lda + c]; // S1 = A11 + A21
+                                                                         // S3 has i2 columns, so is ommited
+                S5[r * i1 + c] = A[r * lda + c]     ;                    // S5 = A11 (- A22)
+                S8[r * i1 + c] = A[(r + n1) * lda + c];                  // S8 = A21 (+ A22)
+                S9[r * i1 + c] = A[r * lda + c] ;                        // S9 = A11 (+ A12)
+
+                A22_pad[r * i1 + c] = 0;
+            }
+        }
+        for (; r < n1; ++r) {
+            size_t c = 0;
+            for (; c < i2; ++c) {
+                // Only matrices with n1 rows can be accesed here (A11, A12)
+                S1[r * i1 + c] = A[r * lda + c];                       // S1 = A11 (+ A21)
+                S3[r * i2 + c] = A[r * lda + c + i1];                  // S3 = A12 (+ A22)
+                S5[r * i1 + c] = A[r * lda + c];                       // S5 = A11 (- A22)
+                                                                       // S8 has r2 rows, so is ommited
+                S9[r * i1 + c] = A[r * lda + c] + A[r * lda + c + i1]; // S9 = A11 + A12
+            }
+
+            for (; c < i1; ++c) {
+                // Only matrices with n1 rows and i1 columns can be accesed (A11)
+                S1[r * i1 + c] = A[r * lda + c]; // S1 = A11 (+ A21)
+                                                 // S3 has i2 columns, so is ommited
+                S5[r * i1 + c] = A[r * lda + c]; // S5 = A11 (- A22)
+                                                 // S8 has r2 rows, so is ommited
+                S9[r * i1 + c] = A[r * lda + c]; // S9 = A11 (+ A12)
+            }
+        }
+
+        // Filling B-side sum matrices
+        r = 0;
+        for (; r < i2; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // All matrices can be accessed here
+                S2[r * m1 + c] = B[r * ldb + c] + B[r * ldb + c + m1];               // S2 = B11 + B12
+                S4[r * m1 + c] = B[(r + i1) * ldb + c] + B[(r + i1) * ldb + c + m1]; // S4 = B21 + B22
+                S6[r * m1 + c] = B[r * ldb + c] + B[(r + i1) * ldb + c + m1];        // S6 = B11 + B22
+                S7[r * m2 + c] = B[r * ldb + c + m1] - B[(r + i1) * ldb + c + m1];   // S7 = B12 - B22
+                S10[r * m1 + c] = B[(r + i1) * ldb + c] - B[r * ldb + c];            // S10 = B21 - B11
+
+                B22_pad[r * m2 + c] = B[(r + i1) * ldb + c + m1];
+            }
+
+            for (; c < m1; ++c) {
+                // Only matrices with m1 columns can be accesed here (B11, B21)
+                S2[r * m1 + c] = B[r * ldb + c];                          // S2 = B11 (+ B12)
+                S4[r * m1 + c] = B[(r + i1) * ldb + c];                   // S4 = B21 (+ B22)
+                S6[r * m1 + c] = B[r * ldb + c];                          // S6 = B11 (+ B22)
+                                                                          // S7 has m2 columns, so is ommited
+                S10[r * m1 + c] = B[(r + i1) * ldb + c] - B[r * ldb + c]; // S10 = B21 - B11
+
+            }
+        }
+        for (; r < i1; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // Only matrices with i1 rows can be accesed here (B11, B12)
+                S2[r * m1 + c] = B[r * ldb + c] + B[r * ldb + c + m1]; // S2 = B11 + B12
+                                                                       // S4 has i2 rows, so is ommited
+                S6[r * m1 + c] = B[r * ldb + c];                       // S6 = B11 (+ B22)
+                S7[r * m2 + c] = B[r * ldb + c + m1];                  // S7 = B12 (- B22)
+                S10[r * m1 + c] = - B[r * ldb + c];                    // S10 = (B21) - B11
+
+                B22_pad[r * m2 + c] = 0;
+            }
+
+            for (; c < m1; ++c) {
+                // Only matrices with i1 rows and m1 columns can be accesed (B11)
+                S2[r * m1 + c] = B[r * ldb + c];    // S2 = B11 (+ B12)
+                                                    // S4 has i2 rows, so is ommited
+                S6[r * m1 + c] = B[r * ldb + c];    // S6 = B11 (+ B22)
+                                                    // S7 has m2 columns, so is ommited
+                S10[r * m1 + c] = - B[r * ldb + c]; // S10 = (B21) - B11
+            }
+        }
+
+        _strassen_serial(S1, i1, S2, m1, P1, m1, n1, i1, m1, arena);       // P1 = S1 * S2
+        _strassen_serial(S3, i2, S4, m1, P2, m1, n1, i2, m1, arena);       // P2 = S3 * S4
+        _strassen_serial(S5, i1, S6, m1, P3, m1, n1, i1, m1, arena);       // P3 = S5 * S6
+        _strassen_serial(A, lda, S7, m2, P4, m2, n1, i1, m2, arena);       // P4 = A11 * S7
+        _strassen_serial(S8, i1, B, ldb, P5, m1, n2, i1, m1, arena);       // P5 = S8 * B11
+        _strassen_serial(S9, i1, B22_pad, m2, P6, m2, n1, i1, m2, arena);  // P6 = S9 * B22
+        _strassen_serial(A22_pad, i1, S10, m1, P7, m1, n2, i1, m1, arena); // P7 = A22 * S10
+
+        // Reconstructing C
+        r = 0;
+        for (; r < n2; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // All matrices can be accessed here 
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c] - P6[r * m2 + c] - P7[r * m1 + c];           // C11 = P2 + P3 - P6 - P7
+                C[r * ldc + c + m1] = P4[r * m2 + c] + P6[r * m2 + c];                                        // C12 = P4 + P6
+                C[(r + n1) * ldc + c] = P5[r * m1 + c] + P7[r * m1 + c];                                      // C21 = P5 + P7
+                C[(r + n1) * ldc + c + m1] = P1[r * m1 + c] - P3[r * m1 + c] - P4[r * m2 + c] - P5[r * m1 + c]; // C22 = P1 - P3 - P4 - P5
+            }
+            for (; c < m1; ++c) {
+                // Only matrices with m1 columns can be accessed here (C11, C21)
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c] - P7[r * m1 + c]; // C11 = P2 + P3 (- P6) - P7
+                                                                                   // C12 only has m2 columns, so is ommited 
+                C[(r + n1) * ldc + c] = P5[r * m1 + c] + P7[r * m1 + c];           // C21 = P5 + P7
+                                                                                   // C22 only has m2 columns, so is ommited
+            }
+        }
+        for (; r < n1; ++r) {
+            size_t c = 0;
+            for (; c < m2; ++c) {
+                // Only matrices with n1 rows can be accessed here (C11, C12)
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c] - P6[r * m2 + c]; // C11 = P2 + P3 - P6 (- P7)
+                C[r * ldc + c + m1] = P4[r * m2 + c] + P6[r * m2 + c];             // C12 = P4 + P6
+                                                                                   // C21 only has n2 rows, so is ommited
+                                                                                   // C22 only has n2 rows, so is ommited
+            }
+            for (; c < m1; ++c) {
+                // Only matrices with n1 rows and m1 columns can be accessed here (C11)
+                C[r * ldc + c] = P2[r * m1 + c] + P3[r * m1 + c]; // C11 = P2 + P3 (- P6 - P7)
+            }
+        }
+
+        arena = arena_save;
+    }
+}
+
+void _strassen_parallel() {
+
+}
+
+mat *mat_mul(const mat *left, const mat *right, err *error) {
+    if (left == NULL || right == NULL) {
+        if (error != NULL) {
+            *error = NULL_ARGUMENT;
+        }
+        return NULL;
+    }
+
+    if (left->num_cols != right->num_rows) {
+        if (error != NULL) {
+            *error = DIMENSION_MISMATCH;
+        }
+        return NULL;
+    };
+
+    size_t n = left->num_rows;
+    size_t i = left->num_cols;
+    size_t m = right->num_cols;
+
+    mat *res = mat_new(n, m);
+
+    if (res == NULL) {
+        if (error != NULL) {
+            *error = ALLOCATION_FAILED;
+        }
+        return NULL;
+    }
+
+    size_t arena_size = 6 * n * i + 6 * i * m + 7 * n * m;
+    float *arena = malloc(arena_size * sizeof(float));
+
+    if (arena == NULL) {
+        if (error != NULL) {
+            *error = ALLOCATION_FAILED;
+        }
+        mat_free(res);
+        return NULL;
+    }
+
+    _strassen_serial(left->data, i, right->data, m, res->data, m, n, i, m, arena);
+
+    free(arena);
 
     if (error != NULL) {
         *error = OK;
@@ -1414,7 +1612,7 @@ void mat_transpose_sqr_r(mat *matrix, err *error) {
 //
 // ************************************************************************************
 
-void mat_row_swap_r_unsafe(mat *matrix, size_t row_1, size_t row_2) {
+void _mat_row_swap_r_unsafe(mat *matrix, size_t row_1, size_t row_2) {
     float tmp[matrix->num_cols]; 
     memcpy(tmp, &matrix->data[row_1 * matrix->num_cols], matrix->num_cols * sizeof(float));
     memcpy(&matrix->data[row_1 * matrix->num_cols], &matrix->data[row_2 * matrix->num_cols], matrix->num_cols * sizeof(float));
@@ -1422,14 +1620,14 @@ void mat_row_swap_r_unsafe(mat *matrix, size_t row_1, size_t row_2) {
     return;
 }
 
-void mat_row_scalar_mult_r_unsafe(mat *matrix, size_t row, float scalar) {
+void _mat_row_scalar_mult_r_unsafe(mat *matrix, size_t row, float scalar) {
     for (size_t j = 0; j < matrix->num_cols; ++j) {
         matrix->data[row * matrix->num_cols + j] *= scalar;
     }
     return;
 }
 
-void mat_row_addrow_r_unsafe(mat *matrix, size_t target_row, size_t row, float scalar) {
+void _mat_row_addrow_r_unsafe(mat *matrix, size_t target_row, size_t row, float scalar) {
     for (size_t j = 0; j < matrix->num_cols; ++j) {
         matrix->data[target_row * matrix->num_cols + j] += scalar * matrix->data[row * matrix->num_cols + j];
     }
@@ -1481,7 +1679,7 @@ mat *mat_row_swap(const mat *matrix, size_t row_1, size_t row_2, err *error) {
         return NULL;
     }
 
-    mat *new = mat_cp_unsafe(matrix);
+    mat *new = _mat_cp_unsafe(matrix);
 
     if (new == NULL) {
         if (error != NULL) {
@@ -1494,7 +1692,7 @@ mat *mat_row_swap(const mat *matrix, size_t row_1, size_t row_2, err *error) {
         return new;
     }
 
-    mat_row_swap_r_unsafe(new, row_1, row_2);
+    _mat_row_swap_r_unsafe(new, row_1, row_2);
 
     if (error != NULL) {
         *error = OK;
@@ -1542,7 +1740,7 @@ mat *mat_row_scalar_mult(const mat *matrix, size_t row, float scalar, err *error
         return NULL;
     }
 
-    mat *new = mat_cp_unsafe(matrix);
+    mat *new = _mat_cp_unsafe(matrix);
 
     if (new == NULL) {
         if (error != NULL) {
@@ -1551,7 +1749,7 @@ mat *mat_row_scalar_mult(const mat *matrix, size_t row, float scalar, err *error
         return NULL;
     }
 
-    mat_row_scalar_mult_r_unsafe(new, row, scalar);
+    _mat_row_scalar_mult_r_unsafe(new, row, scalar);
 
     if (error != NULL) {
         *error = OK;
@@ -1599,7 +1797,7 @@ mat *mat_row_addrow(const mat *matrix, size_t target_row, size_t row, float scal
         return NULL;
     }
 
-    mat *new = mat_cp_unsafe(matrix);
+    mat *new = _mat_cp_unsafe(matrix);
 
     if (new == NULL) {
         if (error != NULL) {
@@ -1608,7 +1806,7 @@ mat *mat_row_addrow(const mat *matrix, size_t target_row, size_t row, float scal
         return NULL;
     }
 
-    mat_row_addrow_r_unsafe(new, target_row, row, scalar);
+    _mat_row_addrow_r_unsafe(new, target_row, row, scalar);
 
     if (error != NULL) {
         *error = OK;
@@ -1657,7 +1855,7 @@ void mat_ref_r(mat *matrix, err *error) {
 
         else {
             size_t pivot = (size_t)i_max;
-            mat_row_swap_r_unsafe(matrix, h, pivot);
+            _mat_row_swap_r_unsafe(matrix, h, pivot);
 
             // Repeat for all rows below the pivot
             for (size_t i = h + 1; i < matrix->num_rows; ++i) {
@@ -1688,7 +1886,7 @@ mat *mat_ref(const mat *matrix, err *error) {
         return NULL;
     }
     
-    mat *new = mat_cp_unsafe(matrix);
+    mat *new = _mat_cp_unsafe(matrix);
 
     if (new == NULL) {
         if (error != NULL) {
@@ -1735,7 +1933,7 @@ void mat_rref_r(mat *matrix, err *error) {
 
         else {
             size_t pivot = (size_t)i_max;
-            mat_row_swap_r_unsafe(matrix, h, pivot);
+            _mat_row_swap_r_unsafe(matrix, h, pivot);
 
              // Repeat for all rows below the pivot
             for (size_t i = h + 1; i < matrix->num_rows; ++i) {
@@ -1770,7 +1968,7 @@ void mat_rref_r(mat *matrix, err *error) {
 
         for (size_t row_above = i - 1; row_above < matrix->num_rows; --row_above) {
             float ff = matrix->data[row_above * matrix->num_cols + pivot_col];
-            mat_row_addrow_r_unsafe(matrix, row_above, i, -ff);
+            _mat_row_addrow_r_unsafe(matrix, row_above, i, -ff);
         }
     }
 
@@ -1788,7 +1986,7 @@ mat *mat_rref(const mat *matrix, err *error) {
         return NULL;
     }
     
-    mat *new = mat_cp_unsafe(matrix);
+    mat *new = _mat_cp_unsafe(matrix);
 
     if (new == NULL) {
         if (error != NULL) {
@@ -1807,9 +2005,46 @@ mat *mat_rref(const mat *matrix, err *error) {
 
 // ************************************************************************************
 //
-// LU Decomposition
+// LUP Decomposition
 //
 // ************************************************************************************
+
+typedef struct {
+    mat *L;
+    mat *U;
+    mat *P;
+    size_t num_permutations;
+} lup_res;
+
+lup_res *lup_new(mat *L, mat *U, mat *P, size_t num_permutations) {
+    if (L == NULL || U == NULL || P == NULL) {
+        return NULL;
+    }
+
+    lup_res *r = malloc(sizeof(*r));
+
+    if (r == NULL) {
+        return NULL;
+    }
+
+    r->L = L;
+    r->U = U;
+    r->P = P;
+    r->num_permutations = num_permutations;
+
+    return r;
+}
+
+void lup_free(lup_res *lup) {
+    if (lup == NULL) {
+        return;
+    }
+
+    mat_free(lup->L);
+    mat_free(lup->U);
+    mat_free(lup->P);
+    free(lup);
+}
 
 lup_res *mat_lup_solve(const mat *A, err *error) {
     if (A == NULL) {
@@ -1829,7 +2064,7 @@ lup_res *mat_lup_solve(const mat *A, err *error) {
     size_t n = A->num_rows;
 
     mat *L = mat_new(n, n);
-    mat *U = mat_cp_unsafe(A);  
+    mat *U = _mat_cp_unsafe(A);  
     mat *P = mat_id(n);
 
     if (L == NULL || U == NULL || P == NULL) {
@@ -1859,9 +2094,9 @@ lup_res *mat_lup_solve(const mat *A, err *error) {
         }
 
         if (pivot != k) {
-            mat_row_swap_r_unsafe(L, k, pivot);
-            mat_row_swap_r_unsafe(U, k, pivot);
-            mat_row_swap_r_unsafe(P, k, pivot);
+            _mat_row_swap_r_unsafe(L, k, pivot);
+            _mat_row_swap_r_unsafe(U, k, pivot);
+            _mat_row_swap_r_unsafe(P, k, pivot);
             ++num_permutations;
         }
 
@@ -1886,54 +2121,18 @@ lup_res *mat_lup_solve(const mat *A, err *error) {
 
 // ************************************************************************************
 //
-// deprecated
+// Cholesky Decomposition
 //
 // ************************************************************************************
 
-[[deprecated]] void mat_ref_explicit_r(mat *matrix, err *error) {
-    if (matrix == NULL) {
-        if (error != NULL) {
-            *error = NULL_ARGUMENT;
-        }
-        return;
-    }
-    
-    size_t h = 0;
-    size_t k = 0;
-
-    while (h < matrix->num_rows && k < matrix->num_cols) {
-        int i_max = _mat_find_pivot_row(matrix, h, k);
-
-        if (i_max < 0) {
-            ++k;
-        }
-
-        else {
-            size_t pivot = (size_t)i_max;
-            mat_row_swap_r_unsafe(matrix, h, pivot);
-
-            for (size_t i = h + 1; i < matrix->num_rows; ++i) {
-                float f = matrix->data[i * matrix->num_cols + k] / matrix->data[h * matrix->num_cols + k];
-                
-                mat_row_addrow_r_unsafe(matrix, i, h, -f);
-            }
-
-            ++h;
-            ++k;
-        }
-    }
-
-    if (error != NULL) {
-        *error = OK;
-    }
-    return;
-}
+// ************************************************************************************
+//
+// Solving Linear Systems
+//
+// ************************************************************************************
 
 #endif 
 
 /*
-#TODO : SIMD for Gauss elimination -- probably very hard, study multilication case more 
 #TODO : Support for complex numbers: use vcmlaq_f32() for complex multiply-accumulate 
-#TODO : Decompositions (LU, )
-
 */
